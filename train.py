@@ -15,18 +15,22 @@ from audio_utils import SpecViewer, WhisperSegFeatureExtractor
 from utils import *
 from model import *
 from datautils import *
-from evaluate import evaluate
+from evaluate_ws import evaluate
 import subprocess
 import json
 
 from transformers import AdamW, get_linear_schedule_with_warmup
 
 def train_iteration(batch):
+    # Convert labels to long type to avoid the Int error
+    if 'labels' in batch and batch['labels'] is not None:
+        batch['labels'] = batch['labels'].long()
+    
     for key in batch:
         batch[key] = batch[key].to(device)
     
     optimizer.zero_grad()
-    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):   
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):  
         model_out = model( **batch )
         loss = model_out.loss.mean()
     scaler.scale(loss).backward()
@@ -67,6 +71,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_num_iterations", type = int, default = None )
     parser.add_argument("--min_num_iterations", type = int, default = 500 )
     parser.add_argument("--val_ratio", type = float, default = 0.0 )
+    parser.add_argument("--val_dataset_folder", default=None, help="Folder containing validation .wav and .csv files")
     
     parser.add_argument("--max_length", type = int, default = 100 )
     parser.add_argument("--total_spec_columns", type = int, default = 1000 )
@@ -134,9 +139,15 @@ if __name__ == "__main__":
     if args.clear_cluster_codebook:
         segmenter.update_cluster_codebook( {} )
 
+    # Use the standard GradScaler without device_type parameter (compatible with all PyTorch versions)
     scaler = torch.cuda.amp.GradScaler()
 
-    audio_path_list_train, label_path_list_train = get_audio_and_label_paths( args.train_dataset_folder ) 
+    audio_path_list_train, label_path_list_train = get_audio_and_label_paths( args.train_dataset_folder )
+    # Load validation paths if provided, otherwise prepare for train/val split
+    if args.val_dataset_folder:
+        audio_path_list_val, label_path_list_val = get_audio_and_label_paths(args.val_dataset_folder)
+    else:
+        audio_path_list_val = label_path_list_val = None
 
     default_config = determine_default_config(audio_path_list_train, label_path_list_train, args.total_spec_columns)
     ## store the default segmentation config
@@ -148,27 +159,30 @@ if __name__ == "__main__":
     
     audio_list_train, label_list_train = load_data(audio_path_list_train, label_path_list_train, cluster_codebook = cluster_codebook, n_threads = 20, default_config = default_config )
 
-    if args.val_ratio > 0:
-        (audio_list_train, label_list_train), ( audio_list_val, label_list_val ) = train_val_split( audio_list_train, label_list_train, args.val_ratio )
+    # If external validation folder provided, skip random splitting
+    if args.val_dataset_folder:
+        audio_list_val, label_list_val = load_data(audio_path_list_val, label_path_list_val, cluster_codebook=cluster_codebook, n_threads=20, default_config=default_config)
+    elif args.val_ratio > 0:
+        (audio_list_train, label_list_train), (audio_list_val, label_list_val) = train_val_split(audio_list_train, label_list_train, args.val_ratio)
+    else:
+        audio_list_val = label_list_val = None
 
     audio_list_train, label_list_train = slice_audios_and_labels( audio_list_train, label_list_train, args.total_spec_columns )
 
     training_dataset = VocalSegDataset( audio_list_train, label_list_train, tokenizer, args.max_length, 
                                          args.total_spec_columns, model.module.config.species_codebook  )
 
-    training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True , 
-                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),  
-                                                                    torch.manual_seed( epoch + x) ], 
-                                             num_workers = args.num_workers, 
-                                             drop_last= True, 
+    training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size, shuffle = True, 
+                                             worker_init_fn = None,  # Removed problematic lambda function
+                                             num_workers = 0,  # Set to 0 to avoid multiprocessing issues
+                                             drop_last= False,  # set drop_last to False to fully utilize small dataset
                                              pin_memory = False
                                            )
     if len(training_dataloader) == 0:
-        training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True , 
-                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),  
-                                                                    torch.manual_seed( epoch + x) ], 
-                                             num_workers = args.num_workers, 
-                                             drop_last= False,  ## set drop_last to False to fully utilize small dataset
+        training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size, shuffle = True, 
+                                             worker_init_fn = None,  # Removed problematic lambda function
+                                             num_workers = 0,  # Set to 0 to avoid multiprocessing issues
+                                             drop_last= False,  # set drop_last to False to fully utilize small dataset
                                              pin_memory = False
                                            )
     ## if the training dataset is really too small, then trigger the error
@@ -301,22 +315,56 @@ if __name__ == "__main__":
 
     if best_checkpoint_batch_number is not None:
         print("The best checkpoint on validation set is: %s," % ( args.model_folder+"/checkpoint-%d"%(best_checkpoint_batch_number) ) )
-        os.system( "cp -r %s %s"%( args.model_folder+"/checkpoint-%d"%(best_checkpoint_batch_number), args.model_folder+"/final_checkpoint"  ) )
-        ### remove other checkpoints
-        os.system( "rm -r %s"%( args.model_folder+"/checkpoint-*" ) )
-
-        hf_model_folder = args.model_folder+"/final_checkpoint"
-        ct2_model_folder = hf_model_folder + "_ct2"
         
-        subprocess.run([ "python", os.path.join( script_dirname, "convert_hf_to_ct2.py" ), 
-                         "--model", hf_model_folder,
-                         "--output_dir", ct2_model_folder,
-                         "--quantization", "int8_float16"
-                       ])
+        # Use platform-independent operations for copying/removing files
+        try:
+            # Copy the best checkpoint to final_checkpoint
+            dest_dir = args.model_folder+"/final_checkpoint"
+            src_dir = args.model_folder+"/checkpoint-%d"%(best_checkpoint_batch_number)
+            
+            if os.path.exists(dest_dir):
+                shutil.rmtree(dest_dir)  # Remove existing directory if it exists
+            
+            # Copy directory using shutil instead of 'cp' command
+            shutil.copytree(src_dir, dest_dir)
+            
+            # Remove checkpoint directories using Python instead of 'rm' command
+            for ckpt_dir in glob(args.model_folder + "/checkpoint-*"):
+                if os.path.isdir(ckpt_dir):
+                    shutil.rmtree(ckpt_dir)
+                    
+            print(f"Successfully copied {src_dir} to {dest_dir} and removed old checkpoints")
+            
+            # Create CT2 model
+            hf_model_folder = args.model_folder+"/final_checkpoint"
+            ct2_model_folder = hf_model_folder + "_ct2"
+            
+            try:
+                # Try to ensure transformers is available
+                import transformers
+                print("Transformers module found, version:", transformers.__version__)
+                
+                # Convert to CTranslate2 with overwrite
+                subprocess.run([
+                    sys.executable,
+                    os.path.join(script_dirname, "convert_hf_to_ct2.py"),
+                    "--model", hf_model_folder,
+                    "--output_dir", ct2_model_folder,
+                    "--quantization", "int8_float16",
+                    "--force"
+                ])
+            except ImportError:
+                print("Warning: transformers module not found for CT2 conversion.")
+                print("Please install it using: pip install transformers")
+                print("Then run the conversion manually with:")
+                print(f"python {os.path.join(script_dirname, 'convert_hf_to_ct2.py')} --model {hf_model_folder} --output_dir {ct2_model_folder} --quantization int8_float16")
+        except Exception as e:
+            print(f"Error during checkpoint handling: {e}")
+    
     try:
-        os.remove( args.model_folder + "/status.json" )
+        os.remove(args.model_folder + "/status.json")
     except:
         pass
     
-    print("All Done!")    
+    print("All Done!")
 

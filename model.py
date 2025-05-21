@@ -32,7 +32,15 @@ def download_model( model_path, ignore_cache = False ):
     ## This model path is a local folder path
     if os.path.exists( model_path ):
         return model_path
+        
+    ## Check if path exists relative to the current directory
+    current_dir = os.getcwd()
+    relative_path = os.path.join(current_dir, model_path)
+    if os.path.exists(relative_path):
+        return relative_path
+        
     ## Suppose that this model path is a model name stored at huggingface 
+    ## Only try to download from Hugging Face if it looks like a valid repo ID (contains a '/' character)
     cache_dir = os.path.expanduser(os.getenv("WHISPERSEG_MODEL_CACHE", "~/.cache/whisperseg_models/"))
 
     os.makedirs(cache_dir, exist_ok=True )
@@ -46,7 +54,16 @@ def download_model( model_path, ignore_cache = False ):
 
     if not os.path.exists(local_model_path) or len(os.listdir(local_model_path)) == 0:
         os.makedirs(local_model_path, exist_ok=True )
-        snapshot_download(model_path, local_dir = local_model_path )
+        
+        # Only attempt to download from Hugging Face if it looks like a valid repository ID
+        if '/' in model_path:
+            try:
+                snapshot_download(model_path, local_dir=local_model_path)
+            except Exception as e:
+                raise ValueError(f"Could not find model at path '{model_path}' and failed to download from Hugging Face: {str(e)}")
+        else:
+            raise ValueError(f"Model path '{model_path}' does not exist locally and doesn't appear to be a valid Hugging Face repository ID.")
+            
     return local_model_path
 
 
@@ -707,4 +724,4 @@ class WhisperSegmenterFast(SegmenterBase):
             
         
         generated_texts_dict[thread_id] = generated_text_list
-    
+
