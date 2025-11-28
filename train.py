@@ -140,7 +140,8 @@ if __name__ == "__main__":
         segmenter.update_cluster_codebook( {} )
 
     # Use the standard GradScaler without device_type parameter (compatible with all PyTorch versions)
-    scaler = torch.cuda.amp.GradScaler()
+    # scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     audio_path_list_train, label_path_list_train = get_audio_and_label_paths( args.train_dataset_folder )
     # Load validation paths if provided, otherwise prepare for train/val split

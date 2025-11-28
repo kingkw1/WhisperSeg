@@ -17,7 +17,8 @@ def get_sampling_rate(file_path):
 
 def read_label( label_path, default_config = {} ):
     if label_path.endswith(".json"):
-        label = json.load( open(label_path) )
+        with open(label_path, 'r', encoding='utf-8') as f:
+            label = json.load(f)
     elif label_path.endswith(".csv"):
         label = pd.read_csv( label_path )
         label = { k:v.tolist() for k,v in label.items() }

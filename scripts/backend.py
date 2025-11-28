@@ -115,7 +115,8 @@ def list_models():
             # training_status_fname = os.path.join( model_base_folder, name, "status.json" )
             training_status_fname = os.path.join( model_base_folder, item["model_name"], "status.json" )
             try:
-                status_data = json.load( open( training_status_fname ) )
+                with open(training_status_fname, 'r', encoding='utf-8') as f:
+                    status_data = json.load(f)
                 eta = status_data["eta"]
                 assert len(re.findall( "^\d+:\d+:\d+$", eta )) == 1
             except:

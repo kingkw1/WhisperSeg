@@ -673,7 +673,8 @@ class WhisperSegmenterFast(SegmenterBase):
             self.model_list = [ ctranslate2.models.Whisper(model_path, device = device, device_index = idx, compute_type = compute_type) for idx in device_ids ]
         self.tokenizer_list = [ WhisperTokenizer.from_pretrained(model_path+"/hf_model", language = "english" ) for _ in self.device_list ]
         
-        model_config = json.load(open(model_path+"/hf_model"+"/config.json"))        
+        with open(model_path+"/hf_model"+"/config.json", 'r', encoding='utf-8') as f:
+            model_config = json.load(f)
         self.total_spec_columns = model_config["total_spec_columns"]
         self.cluster_codebook = model_config["cluster_codebook"]
         self.inverse_cluster_codebook = { cluster_id:cluster  for cluster, cluster_id in self.cluster_codebook.items() }
